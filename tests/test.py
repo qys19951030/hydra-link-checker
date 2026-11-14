@@ -821,6 +821,28 @@ class TestCrawlInventory(unittest.TestCase):
         rows = self._load_rows()
         self.assertEqual(len(rows), 4)  # overwritten, not duplicated
 
+    def test_invalid_link_still_gets_a_row(self):
+        inv = InventoryStore(self.inv_path)
+        inv.open_for_writing()
+        check = Checker(self.base + "/", Config(), inventory=inv)
+        with check.TO_PROCESS.mutex:
+            check.TO_PROCESS.queue.clear()
+        # A relative link enqueued without an absolute base cannot be
+        # normalized: it must still occupy exactly one inventory row.
+        check.TO_PROCESS.put(
+            {"parent": self.base + "/", "url": "not-an-absolute-url",
+             "depth": 1, "tag": "a", "attr": "href"}
+        )
+        check.run()
+        check.pool.shutdown()
+        inv.close()
+
+        rows = self._load_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], 0)
+        self.assertEqual(rows[0]["error"], "invalid_url")
+        self.assertEqual(rows[0]["url"], "not-an-absolute-url")
+
     def test_failed_probe_still_gets_a_row(self):
         inv = InventoryStore(self.inv_path)
         inv.open_for_writing()

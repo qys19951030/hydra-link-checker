@@ -521,6 +521,15 @@ class Checker:
         row = self._make_row(page)
         started = time.monotonic()
 
+        if page.get("_invalid"):
+            # The link could not be normalized into an absolute URL: record
+            # the invalid_url category instead of attempting a request.
+            self._finish_timing(row, started)
+            row["error"] = ERROR_INVALID_URL
+            self.add_entry(0, ValueError("invalid URL: {0}".format(page["url"])), page)
+            self._record_row(row)
+            return None
+
         # Use GET as HEAD is frequently not allowed
         r = request.Request(
             page["url"],
@@ -724,17 +733,24 @@ class Checker:
                     self.mailto_links.append(email)
                     continue
 
-                # Canonical de-dup key; fall back to the raw URL when a link
-                # cannot be normalized so it still gets probed exactly once.
+                # Canonical de-dup key. An un-normalizable link is not
+                # dropped: it still gets exactly one probe job, which records
+                # an invalid_url row instead of making a request.
+                invalid = False
                 try:
                     key = normalize_url(target_url["url"])
                 except ValueError:
                     key = target_url["url"]
+                    invalid = True
 
                 if key in self.seen_keys or target_url["url"] in self.visited:
                     continue
 
-                if self.inventory is not None and self.inventory.should_skip(key):
+                if (
+                    not invalid
+                    and self.inventory is not None
+                    and self.inventory.should_skip(key)
+                ):
                     # Resume: a previous successful probe, no request sent.
                     self.seen_keys.add(key)
                     self.visited.add(target_url["url"])
@@ -744,6 +760,8 @@ class Checker:
 
                 self.seen_keys.add(key)
                 self.visited.add(target_url["url"])
+                if invalid:
+                    target_url = dict(target_url, _invalid=True)
                 with self._lock:
                     self._pending += 1
                     self.checked += 1
