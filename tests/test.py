@@ -14,6 +14,7 @@ from urllib import error
 from hydra import (
     Checker,
     Config,
+    HostGate,
     INVENTORY_FIELDS,
     InventoryStore,
     Parser,
@@ -485,6 +486,86 @@ class TestInventoryStore(unittest.TestCase):
         self.assertEqual(len(store.rows()), 1)
         store.rewrite()  # must be a no-op, not an error
         store.close()
+
+
+class TestHostGate(unittest.TestCase):
+    """Per-host concurrency cap and request interval."""
+
+    def test_unlimited_gate_never_blocks(self):
+        gate = HostGate()  # 0, 0 means no limits
+        for _ in range(20):
+            gate.acquire("h")
+        # release on an unlimited gate is a harmless no-op
+        for _ in range(20):
+            gate.release("h")
+
+    def test_concurrency_cap_never_exceeded(self):
+        gate = HostGate(max_per_host=2)
+        peak = [0]
+        peak_lock = threading.Lock()
+        stop = threading.Event()
+
+        def worker():
+            while not stop.is_set():
+                gate.acquire("h")
+                with peak_lock:
+                    peak[0] = max(peak[0], gate._hosts["h"]["in_flight"])
+                time.sleep(0.01)
+                gate.release("h")
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.3)
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        self.assertEqual(peak[0], 2)
+
+    def test_interval_spaces_request_starts(self):
+        gate = HostGate(interval=0.2)
+        starts = []
+        for _ in range(3):
+            gate.acquire("h")
+            starts.append(time.monotonic())
+            gate.release("h")
+        gaps = [starts[i + 1] - starts[i] for i in range(len(starts) - 1)]
+        for gap in gaps:
+            self.assertGreaterEqual(gap, 0.19)
+
+    def test_different_hosts_do_not_block_each_other(self):
+        gate = HostGate(max_per_host=1)
+        gate.acquire("a")  # host a is now at its cap
+        # host b must still be acquirable immediately
+        ready = threading.Event()
+
+        def grab_b():
+            gate.acquire("b")
+            ready.set()
+            gate.release("b")
+
+        thread = threading.Thread(target=grab_b)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=1.0))
+        thread.join()
+        gate.release("a")
+
+    def test_cap_blocks_then_releases(self):
+        gate = HostGate(max_per_host=1)
+        gate.acquire("h")
+        got = threading.Event()
+
+        def second():
+            gate.acquire("h")
+            got.set()
+            gate.release("h")
+
+        thread = threading.Thread(target=second)
+        thread.start()
+        self.assertFalse(got.wait(timeout=0.15))
+        gate.release("h")
+        self.assertTrue(got.wait(timeout=1.0))
+        thread.join()
 
 
 if __name__ == "__main__":

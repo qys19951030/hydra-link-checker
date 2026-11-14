@@ -6,6 +6,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from concurrent import futures
 from html.parser import HTMLParser
 from http.client import IncompleteRead, InvalidURL
@@ -140,21 +141,64 @@ def classify_error(exc):
 
 
 class HostGate:
-    """Per-host request spacing and concurrency limits (skeleton)."""
+    """Per-host request spacing and concurrency limits.
+
+    Different hosts stay independent, so requests to host B never wait on
+    limits for host A; overall parallelism is still bounded by the
+    ThreadPoolExecutor's thread count. interval/max_per_host of 0 mean
+    unlimited.
+    """
 
     def __init__(self, interval=0.0, max_per_host=0):
-        self.interval = interval
-        self.max_per_host = max_per_host
+        self.interval = float(interval)
+        self.max_per_host = int(max_per_host) if max_per_host else 0
+        self._cond = threading.Condition()
+        # host -> {"in_flight": int, "next_allowed_at": monotonic timestamp}
+        self._hosts = {}
+
+    def _state(self, host):
+        state = self._hosts.get(host)
+        if state is None:
+            state = {"in_flight": 0, "next_allowed_at": 0.0}
+            self._hosts[host] = state
+        return state
 
     def acquire(self, host):
-        """Block until a request to host may start."""
-        # Filled in a later step.
-        raise NotImplementedError
+        """Block until a request to host may start, then take a slot."""
+        if self.interval == 0.0 and self.max_per_host == 0:
+            return
+        with self._cond:
+            state = self._state(host)
+            while True:
+                now = time.monotonic()
+                concurrency_ok = (
+                    self.max_per_host == 0
+                    or state["in_flight"] < self.max_per_host
+                )
+                wait_for = state["next_allowed_at"] - now
+                if concurrency_ok and wait_for <= 0:
+                    state["in_flight"] += 1
+                    if self.interval > 0:
+                        state["next_allowed_at"] = now + self.interval
+                    return
+                # Two independent waits: a release notifies waiters when a
+                # concurrency slot frees up; the interval simply times out.
+                if not concurrency_ok:
+                    self._cond.wait(
+                        timeout=wait_for if wait_for > 0 else None
+                    )
+                else:
+                    self._cond.wait(timeout=wait_for)
 
     def release(self, host):
         """Release one concurrency slot for host."""
-        # Filled in a later step.
-        raise NotImplementedError
+        if self.max_per_host == 0:
+            return
+        with self._cond:
+            state = self._state(host)
+            if state["in_flight"] > 0:
+                state["in_flight"] -= 1
+            self._cond.notify_all()
 
 
 class InventoryStore:
