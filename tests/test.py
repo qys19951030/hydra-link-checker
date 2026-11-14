@@ -2,14 +2,19 @@ import functools
 import http.server
 import json
 import os
+import signal
 import socket
 import socketserver
 import ssl
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from urllib import error
+
+HYDRA = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "hydra.py"))
 
 from hydra import (
     Checker,
@@ -837,6 +842,221 @@ class TestCrawlInventory(unittest.TestCase):
         # And the failure still feeds the classic broken-link report.
         self.assertEqual(len(check.broken), 1)
         self.assertEqual(check.broken[0]["code"], 0)
+
+
+class TestCliAndSummary(unittest.TestCase):
+    """Exercise the real command line end to end, fully offline."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.inv_path = os.path.join(self.tmpdir, "inventory.jsonl")
+        self.summary_path = os.path.join(self.tmpdir, "summary.json")
+        pages = {
+            "/": (
+                200,
+                {"Content-Type": "text/html"},
+                b'<a href="a">a</a><a href="b">b</a><a href="missing">x</a>',
+            ),
+            "/a": (200, {"Content-Type": "text/plain"}, b"a-body"),
+            "/b": (200, {"Content-Type": "text/plain"}, b"b-body"),
+        }
+        self.server, self.base = start_fixture_server(pages)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def _run_cli(self, *extra):
+        env = dict(os.environ)
+        # Keep proxy environment from intercepting localhost in CI boxes.
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env["no_proxy"] = "127.0.0.1,localhost"
+        return subprocess.run(
+            [sys.executable, HYDRA, self.base + "/"] + list(extra),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+
+    def _read_inventory(self):
+        with open(self.inv_path, "r", encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_no_new_flags_keeps_legacy_behavior(self):
+        result = self._run_cli()
+        self.assertEqual(result.returncode, 1)  # one broken link, old exit code
+        self.assertIn("title: Broken Link Report", result.stdout)
+        self.assertIn("broken: 1", result.stdout)
+        self.assertFalse(os.path.exists(self.inv_path))
+        self.assertFalse(os.path.exists(self.summary_path))
+
+    def test_inventory_and_summary_reconcile(self):
+        result = self._run_cli(
+            "--inventory", self.inv_path, "--summary", self.summary_path
+        )
+        self.assertEqual(result.returncode, 1)
+
+        rows = self._read_inventory()
+        self.assertEqual(len(rows), 4)
+        with open(self.summary_path, "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+
+        self.assertEqual(summary["discovered"], len(rows))
+        self.assertEqual(
+            summary["probed"] + summary["skipped"], summary["discovered"]
+        )
+        self.assertEqual(
+            summary["successful"] + summary["failed"], summary["discovered"]
+        )
+        self.assertEqual(summary["skipped"], 0)
+        self.assertEqual(summary["seed_url"], self.base + "/")
+        self.assertTrue(summary["run_id"])
+        self.assertTrue(summary["started_at"].endswith("+00:00"))
+
+        # Status distribution counts must match the rows one for one.
+        counted = {}
+        for row in rows:
+            counted[str(row["status"])] = counted.get(str(row["status"]), 0) + 1
+        self.assertEqual(summary["status_distribution"], counted)
+        self.assertEqual(summary["error_distribution"], {})
+
+    def test_resume_run_skips_and_summary_reflects_it(self):
+        self._run_cli("--inventory", self.inv_path, "--summary", self.summary_path)
+        result = self._run_cli(
+            "--inventory", self.inv_path, "--summary", self.summary_path
+        )
+        self.assertEqual(result.returncode, 0)  # nothing newly broken this run
+        with open(self.summary_path, "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        self.assertEqual(summary["probed"], 0)
+        self.assertEqual(summary["skipped"], 4)
+        self.assertEqual(len(self._read_inventory()), 4)
+
+    def test_refresh_reprobes_all(self):
+        self._run_cli("--inventory", self.inv_path)
+        result = self._run_cli(
+            "--inventory", self.inv_path,
+            "--summary", self.summary_path, "--refresh",
+        )
+        self.assertEqual(result.returncode, 1)
+        with open(self.summary_path, "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        self.assertEqual(summary["probed"], 4)
+        self.assertEqual(summary["skipped"], 0)
+        self.assertEqual(len(self._read_inventory()), 4)
+
+    def test_summary_without_inventory_is_rejected(self):
+        result = self._run_cli("--summary", self.summary_path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--summary requires --inventory", result.stdout)
+
+    def test_per_host_interval_slows_single_host_crawl(self):
+        # Four pages all on one host; a 0.2s interval must space them out.
+        start = time.monotonic()
+        result = self._run_cli(
+            "--inventory", self.inv_path, "--per-host-interval", "0.2"
+        )
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 1)
+        self.assertGreaterEqual(elapsed, 0.6)  # 4 requests, 3 gaps
+        self.assertEqual(len(self._read_inventory()), 4)
+
+    def test_max_per_host_caps_concurrency(self):
+        # Cap of 1 against a server whose responses sleep: with several pages
+        # the crawl must still complete, having serialized host requests.
+        slow_pages = {
+            "/": (
+                200,
+                {"Content-Type": "text/html"},
+                b'<a href="s1">1</a><a href="s2">2</a><a href="s3">3</a>',
+            ),
+        }
+        for name in ("/s1", "/s2", "/s3"):
+            slow_pages[name] = (200, {"Content-Type": "text/plain"}, b"x")
+
+        gate = HostGate(max_per_host=1)
+        inv = InventoryStore(os.path.join(self.tmpdir, "cap.jsonl"))
+        inv.open_for_writing()
+
+        original_load = Checker.load_url
+
+        def instrumented_load(self_, page, timeout):
+            host = extract_domain(page["url"])
+            gate.acquire(host)
+            try:
+                in_flight = gate._hosts[host]["in_flight"]
+                self.assertLessEqual(in_flight, 1)
+                time.sleep(0.05)
+                return original_load(self_, page, timeout)
+            finally:
+                gate.release(host)
+
+        server, base = start_fixture_server(slow_pages)
+        try:
+            # Gate lives only in the instrumented fetch so we can observe the
+            # in-flight count at request start.
+            check = Checker(base + "/", Config(), inventory=inv)
+            check.load_url = instrumented_load.__get__(check, Checker)
+            with check.TO_PROCESS.mutex:
+                check.TO_PROCESS.queue.clear()
+            check.TO_PROCESS.put(
+                {"parent": base + "/", "url": base + "/",
+                 "depth": 0, "tag": "", "attr": ""}
+            )
+            check.run()
+            check.pool.shutdown()
+        finally:
+            server.shutdown()
+            server.server_close()
+            inv.close()
+        self.assertEqual(len(inv.rows()), 4)
+
+    def test_interrupted_run_leaves_parseable_lines_and_no_summary(self):
+        # A server that sleeps on each response so the crawl is still running
+        # when we send SIGINT.
+        class SlowHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                time.sleep(0.3)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<p>ok</p>")
+
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = "http://127.0.0.1:{0}/".format(server.server_address[1])
+        env = dict(os.environ)
+        env["NO_PROXY"] = "127.0.0.1,localhost"
+        env["no_proxy"] = "127.0.0.1,localhost"
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, HYDRA, base,
+                 "--inventory", self.inv_path, "--summary", self.summary_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            time.sleep(0.6)
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+            self.assertEqual(proc.returncode, 130)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        # Every persisted line is a complete JSON object; no half lines.
+        rows = self._read_inventory()
+        self.assertGreaterEqual(len(rows), 1)
+        for row in rows:
+            self.assertIn("url", row)
+            self.assertIn("checked_at", row)
+        # Summary is only written after a complete run.
+        self.assertFalse(os.path.exists(self.summary_path))
 
 
 if __name__ == "__main__":

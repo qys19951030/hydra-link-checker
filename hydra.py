@@ -472,6 +472,7 @@ class Checker:
         # Probe counters for the summary file.
         self.checked = 0
         self.skipped = 0
+        self.seed_url = url
 
     def _make_row(self, page):
         """Build an inventory row skeleton for page with the fixed fields."""
@@ -754,6 +755,63 @@ class Checker:
                 print(e)
 
 
+    def build_summary(self, run_id, started_at, finished_at):
+        """Build the summary dict, with every count derived from inventory rows.
+
+        Computing the distributions from the final rows rather than from
+        separate counters means the summary can never disagree with the
+        inventory.
+        """
+        rows = self.inventory.rows() if self.inventory is not None else []
+        discovered = len(rows)
+        # Probed this run = everything not skipped; skipped is tracked live.
+        probed = discovered - self.skipped
+        status_dist = {}
+        error_dist = {}
+        success = 0
+        failure = 0
+        for row in rows:
+            if row.get("error"):
+                error_name = row["error"]
+                error_dist[error_name] = error_dist.get(error_name, 0) + 1
+                failure += 1
+            else:
+                code = str(row.get("status", 0))
+                status_dist[code] = status_dist.get(code, 0) + 1
+                if row.get("status", 0) in self.config.OK:
+                    success += 1
+                else:
+                    failure += 1
+        return {
+            "run_id": run_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "seed_url": self.seed_url,
+            "discovered": discovered,
+            "probed": probed,
+            "skipped": self.skipped,
+            "successful": success,
+            "failed": failure,
+            "status_distribution": status_dist,
+            "error_distribution": error_dist,
+        }
+
+
+def write_summary_atomic(filename, summary):
+    """Overwrite the summary file atomically; only called after a full run."""
+    tmp_name = filename + ".tmp"
+    with open(tmp_name, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_name, filename)
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def main():
     """Validate arguments and run Hydra"""
     parg = argparse.ArgumentParser(
@@ -764,11 +822,46 @@ def main():
         "URL", help="The URL of the website to crawl, e.g. https://example.com"
     )
     parg.add_argument("--config", "-c", help="Path to a configuration file")
+    parg.add_argument(
+        "--inventory",
+        help="Path to the JSON-lines inventory file; one complete row is "
+        "appended per link as it is probed. Re-running with the same file "
+        "resumes from its successful rows.",
+    )
+    parg.add_argument(
+        "--summary",
+        help="Path to the JSON run summary, overwritten after a full run. "
+        "Requires --inventory.",
+    )
+    parg.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Ignore previous inventory results and re-probe every link, "
+        "overwriting rows in place.",
+    )
+    parg.add_argument(
+        "--per-host-interval",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between request starts to the same host "
+        "(default: 0, no limit).",
+    )
+    parg.add_argument(
+        "--max-per-host",
+        type=int,
+        default=0,
+        help="Maximum simultaneous requests to the same host "
+        "(default: 0, no limit).",
+    )
     args = parg.parse_args()
 
     # If a configuration file path was provided, ensure we can find it
     if args.config and not path.exists(args.config):
         print(f"Can't find {args.config} as config file.")
+        sys.exit(1)
+
+    if args.summary and not args.inventory:
+        print("--summary requires --inventory.")
         sys.exit(1)
 
     # Ensure we have a valid URL to crawl
@@ -779,15 +872,53 @@ def main():
         sys.exit(1)
 
     # Configure and run Hydra
-    first_url = {"parent": url, "url": url}
     config_file = ""  # Uses default settings if no configuration file provided
     if args.config:
         config_file = args.config
     config = Config(config_file)
-    check = Checker(url, config)
-    check.TO_PROCESS.put(first_url)
-    check.run()
+
+    inventory = None
+    if args.inventory:
+        inventory = InventoryStore(args.inventory, refresh=args.refresh)
+        inventory.load()
+        inventory.open_for_writing()
+
+    gate = None
+    if args.per_host_interval > 0 or args.max_per_host > 0:
+        gate = HostGate(args.per_host_interval, args.max_per_host)
+
+    check = Checker(url, config, inventory=inventory, gate=gate)
+    check.prime_from_inventory()
+    check.TO_PROCESS.put(
+        {"parent": url, "url": url, "depth": 0, "tag": "", "attr": ""}
+    )
+
+    run_id = uuid.uuid4().hex
+    started_at = utc_now_iso()
+    interrupted = False
+    try:
+        check.run()
+    except KeyboardInterrupt:
+        # Rows already appended are complete lines; just stop cleanly. The
+        # summary is intentionally not written on an interrupted run.
+        interrupted = True
+    finally:
+        check.pool.shutdown(wait=True)
+        if inventory is not None:
+            inventory.close()
+
     print(check.make_report())
+
+    if interrupted:
+        sys.exit(130)
+
+    if inventory is not None:
+        # Collapse append-only history to one line per key, in first-seen order.
+        inventory.rewrite()
+        if args.summary:
+            finished_at = utc_now_iso()
+            summary = check.build_summary(run_id, started_at, finished_at)
+            write_summary_atomic(args.summary, summary)
 
     if check.broken and not check.config.graceful_exit:
         sys.exit(1)
