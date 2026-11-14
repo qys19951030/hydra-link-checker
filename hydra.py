@@ -7,7 +7,9 @@ import ssl
 import sys
 import threading
 import time
+import uuid
 from concurrent import futures
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from http.client import IncompleteRead, InvalidURL
 from os import path
@@ -47,6 +49,33 @@ DEFAULT_PORTS = {"http": 80, "https": 443, "ftp": 21}
 
 class TooManyRedirects(Exception):
     """Raised when a request follows more redirects than allowed."""
+
+
+class RedirectRecorder(request.HTTPRedirectHandler):
+    """Record every hop of a redirect chain and enforce a hop limit.
+
+    Installed ahead of urllib's default redirect handler so it owns redirect
+    decisions. "redirects" ends up as the chain from the first jump's
+    Location through the final landed URL; no redirects means an empty list.
+    """
+
+    max_redirections = 10
+
+    def __init__(self):
+        self.redirects = []
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if len(self.redirects) >= self.max_redirections:
+            raise TooManyRedirects(
+                "more than {0} redirects".format(self.max_redirections)
+            )
+        target = request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl
+        )
+        if target is None:
+            raise TooManyRedirects("unsupported redirect to {0}".format(newurl))
+        self.redirects.append(target.full_url)
+        return target
 
 
 def _resolve_path_dots(url_path):
@@ -122,19 +151,12 @@ def classify_error(exc):
         return ERROR_TLS
     if isinstance(exc, ConnectionRefusedError):
         return ERROR_CONNECTION_REFUSED
-    if isinstance(exc, error.URLError):
-        reason = getattr(exc, "reason", exc)
-        if isinstance(reason, (socket.timeout, TimeoutError)):
-            return ERROR_TIMEOUT
-        if isinstance(reason, ssl.SSLError):
-            return ERROR_TLS
-        if isinstance(reason, ConnectionRefusedError):
-            return ERROR_CONNECTION_REFUSED
-        if isinstance(reason, socket.gaierror):
-            return ERROR_DNS
-        return ERROR_NETWORK
     if isinstance(exc, socket.gaierror):
         return ERROR_DNS
+    if isinstance(exc, error.URLError):
+        # urllib wraps the real network failure as the "reason"; unwrap it
+        # before falling back to a generic network error.
+        return classify_error(getattr(exc, "reason", exc))
     if isinstance(exc, (InvalidURL, UnicodeError, TypeError, ValueError)):
         return ERROR_INVALID_URL
     return ERROR_NETWORK
@@ -377,7 +399,23 @@ class Parser(HTMLParser):
     def __init__(self, config):
         super(Parser, self).__init__()
         self.links = []
+        self.link_refs = []
+        self._capture = False
         self.config = config
+
+    def feed_me(self, data):
+        self.links = []
+        self.feed(data)
+        return self.links
+
+    def feed_me_refs(self, data):
+        """Like feed_me, but keep the (tag, attribute, raw value) per link."""
+        self.link_refs = []
+        self._capture = True
+        self.links = []
+        self.feed(data)
+        self._capture = False
+        return self.link_refs
 
     def handle_starttag(self, tag, attrs):
         """Method html.parser.HTMLParser.handle_starttag"""
@@ -397,11 +435,8 @@ class Parser(HTMLParser):
                 if len(exclude_list) > 0:
                     return
                 self.links.append(a[1])
-
-    def feed_me(self, data):
-        self.links = []
-        self.feed(data)
-        return self.links
+                if getattr(self, "_capture", False):
+                    self.link_refs.append({"tag": tag, "attr": a[0], "value": a[1]})
 
     def error(self, msg):
         return msg
@@ -416,11 +451,16 @@ def extract_domain(link):
 class Checker:
     TO_PROCESS = Queue()
 
-    def __init__(self, url, config):
+    def __init__(self, url, config, inventory=None, gate=None):
         self.config = config
+        self.inventory = inventory
+        self.gate = gate
         self.broken = []
         self.domain = extract_domain(url)
         self.visited = set()
+        # De-duplication set keyed by normalized URL; self.visited keeps the
+        # raw URLs for the existing YAML report ("checked" count etc.).
+        self.seen_keys = set()
         self.mailto_links = list()
         self.pool = futures.ThreadPoolExecutor(max_workers=self.config.threads)
         self.report = ""
@@ -429,6 +469,31 @@ class Checker:
         # enqueue more links via their done callback.
         self._lock = threading.Lock()
         self._pending = 0
+        # Probe counters for the summary file.
+        self.checked = 0
+        self.skipped = 0
+
+    def _make_row(self, page):
+        """Build an inventory row skeleton for page with the fixed fields."""
+        return {
+            "url": page["url"],
+            "parent": page["parent"],
+            "depth": page.get("depth", 0),
+            "tag": page.get("tag", ""),
+            "attr": page.get("attr", ""),
+            "status": 0,
+            "content_type": "",
+            "bytes": 0,
+            "redirects": [],
+            "elapsed_ms": 0,
+            "error": None,
+            "checked_at": "",
+        }
+
+    def _record_row(self, row):
+        """Persist one row (immediately) or keep it in memory."""
+        if self.inventory is not None:
+            self.inventory.record(row)
 
     def add_entry(self, code, reason, page):
         """Add a link to the report"""
@@ -445,15 +510,15 @@ class Checker:
         self.broken.append(entry)
 
     def load_url(self, page, timeout):
-        """ Try to retrieve contents of a page and record result
-            Store the link to be checked and its parent in the result
+        """Retrieve a page, record one inventory row, return crawl data.
+
+        On success the result dict feeds parse_page exactly as before, so the
+        YAML broken-links report is unchanged. Every probe — success, HTTP
+        error status, or network-layer failure — writes exactly one inventory
+        row. A failure here never raises into the thread pool.
         """
-        result = {
-            "url": page["url"],
-            "parent": page["parent"],
-            "data": "",
-            "valid_content_type": False,
-        }
+        row = self._make_row(page)
+        started = time.monotonic()
 
         # Use GET as HEAD is frequently not allowed
         r = request.Request(
@@ -462,61 +527,105 @@ class Checker:
                 "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0"
             },
         )
+        recorder = RedirectRecorder()
+        # An empty ProxyHandler makes every connection direct regardless of
+        # proxy environment variables, which can otherwise turn a local
+        # connection refusal into a proxy's 502 response.
+        opener = request.build_opener(recorder, request.ProxyHandler({}))
 
+        host = extract_domain(page["url"])
+        if self.gate is not None:
+            self.gate.acquire(host)
         try:
-            http_response = request.urlopen(r, timeout=self.config.timeout)
+            try:
+                http_response = opener.open(r, timeout=self.config.timeout)
+            except error.HTTPError as e:
+                # We got a response: record its final status, not an error
+                # category. The YAML report still lists it as broken.
+                self._finish_timing(row, started)
+                row["status"] = e.getcode()
+                row["content_type"] = e.headers.get("Content-Type") or ""
+                row["redirects"] = list(recorder.redirects)
+                self.add_entry(e.getcode(), e.reason, page)
+                self._record_row(row)
+                return None
+            except (
+                error.URLError,
+                ConnectionRefusedError,
+                ConnectionResetError,
+                IncompleteRead,
+                InvalidURL,
+                NotImplementedError,
+                SocketTimeoutError,
+                TimeoutError,
+                TypeError,
+                UnicodeError,
+                OSError,
+            ) as e:
+                # No response at all: network-layer problem with a stable
+                # category name. The old behavior recorded code 0 here.
+                self._finish_timing(row, started)
+                row["status"] = 0
+                row["redirects"] = list(recorder.redirects)
+                row["error"] = classify_error(e)
+                self.add_entry(0, e, page)
+                self._record_row(row)
+                return None
 
-            encoding = http_response.headers.get("Content-Encoding")
-            if encoding and "gzip" in encoding:
-                data = gzip.decompress(http_response.read()).decode(
-                    encoding="utf-8", errors="ignore"
+            raw_body = b""
+            try:
+                raw_body = http_response.read()
+                encoding = http_response.headers.get("Content-Encoding")
+                if encoding and "gzip" in encoding:
+                    data = gzip.decompress(raw_body).decode(
+                        encoding="utf-8", errors="ignore"
+                    )
+                elif encoding is None:
+                    data = raw_body.decode(encoding="utf-8", errors="ignore")
+                else:
+                    # Support for other less common directives not handled
+                    raise NotImplementedError
+            except (IncompleteRead, NotImplementedError, OSError) as e:
+                self._finish_timing(row, started)
+                row["status"] = http_response.getcode()
+                row["content_type"] = (
+                    http_response.headers.get("Content-Type") or ""
                 )
-            elif encoding is None:
-                data = http_response.read().decode(encoding="utf-8", errors="ignore")
-            else:
-                # Support for other less common directives not handled
-                raise NotImplementedError
-            result["data"] = data
+                row["bytes"] = len(raw_body)
+                row["redirects"] = list(recorder.redirects)
+                row["error"] = classify_error(e)
+                self.add_entry(0, e, page)
+                self._record_row(row)
+                return None
 
-            content_type = http_response.headers.get("Content-Type")
-            if (
-                content_type is not None
-                and "text/html" in content_type
-                or "text/plain" in content_type
-            ):
-                valid_content_type = True
-            else:
-                valid_content_type = False
-            result["valid_content_type"] = valid_content_type
+            self._finish_timing(row, started)
+            row["status"] = http_response.getcode()
+            row["content_type"] = http_response.headers.get("Content-Type") or ""
+            row["bytes"] = len(raw_body)
+            row["redirects"] = list(recorder.redirects)
+            self._record_row(row)
+        finally:
+            if self.gate is not None:
+                self.gate.release(host)
 
-        except error.HTTPError as e:
-            code = e.getcode()
-            reason = e.reason
-            self.add_entry(code, reason, page)
-            return
-        except (
-            error.URLError,
-            ConnectionRefusedError,
-            ConnectionResetError,
-            IncompleteRead,
-            InvalidURL,
-            NotImplementedError,
-            SocketTimeoutError,
-            TimeoutError,
-            TypeError,
-            UnicodeError,
-        ) as e:
-            code = 0
-            reason = e
-            self.add_entry(code, reason, page)
-            return
-        except TimeoutError as e:
-            code = 408
-            reason = e
-            self.add_entry(code, reason, page)
-            return
+        content_type = row["content_type"]
+        valid_content_type = (
+            content_type is not None
+            and ("text/html" in content_type or "text/plain" in content_type)
+        )
 
+        result = {
+            "url": page["url"],
+            "parent": page["parent"],
+            "data": data,
+            "valid_content_type": valid_content_type,
+        }
         return result
+
+    @staticmethod
+    def _finish_timing(row, started):
+        row["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        row["checked_at"] = datetime.now(timezone.utc).isoformat()
 
     def handle_future(self, result):
         if result.result():
@@ -539,14 +648,21 @@ class Checker:
         """Get more links from successfully retrieved pages in the same domain"""
         if self.domain == extract_domain(page["url"]) and page["valid_content_type"]:
             parent = page["url"]
+            parent_depth = page.get("depth", 0)
             parser = Parser(self.config)
-            links = parser.feed_me(page["data"])
-            new_links = [x for x in links if x not in self.visited]
-            full_links = [parse.urljoin(parent, l) for l in new_links]
-            for l in full_links:
-                if l not in self.visited:
-                    li = {"parent": parent, "url": l}
-                    self.TO_PROCESS.put(li)
+            refs = parser.feed_me_refs(page["data"])
+            for ref in refs:
+                full_link = parse.urljoin(parent, ref["value"])
+                if full_link in self.visited:
+                    continue
+                li = {
+                    "parent": parent,
+                    "url": full_link,
+                    "depth": parent_depth + 1,
+                    "tag": ref["tag"],
+                    "attr": ref["attr"],
+                }
+                self.TO_PROCESS.put(li)
 
     def make_report(self):
         """Parse broken links list into YAML report"""
@@ -562,6 +678,27 @@ class Checker:
         for link in sorted_list:
             self.report += f"\n- code:    {link['code']}\n  url:     {link['link']}\n  parent:  {link['parent']}\n  error:   {link['err']}\n"
         return self.report
+
+    def prime_from_inventory(self):
+        """Re-enqueue rows already known to the inventory.
+
+        On resume after a crash the crawl ancestor chain may be broken, so
+        every previously discovered URL is put back in the queue. Successful
+        rows are skipped in run(); failed rows get re-probed. Metadata from
+        the old row (parent/depth/tag/attr) is carried over.
+        """
+        if self.inventory is None:
+            return
+        for row in self.inventory.rows():
+            self.TO_PROCESS.put(
+                {
+                    "parent": row["parent"],
+                    "url": row["url"],
+                    "depth": row.get("depth", 0),
+                    "tag": row.get("tag", ""),
+                    "attr": row.get("attr", ""),
+                }
+            )
 
     def run(self):
         """Run crawler until the queue is drained and no jobs are in flight.
@@ -584,15 +721,35 @@ class Checker:
                 if target_url["url"].startswith("mailto:"):
                     email = target_url["url"][len("mailto:") :]
                     self.mailto_links.append(email)
+                    continue
 
-                elif target_url["url"] not in self.visited:
+                # Canonical de-dup key; fall back to the raw URL when a link
+                # cannot be normalized so it still gets probed exactly once.
+                try:
+                    key = normalize_url(target_url["url"])
+                except ValueError:
+                    key = target_url["url"]
+
+                if key in self.seen_keys or target_url["url"] in self.visited:
+                    continue
+
+                if self.inventory is not None and self.inventory.should_skip(key):
+                    # Resume: a previous successful probe, no request sent.
+                    self.seen_keys.add(key)
                     self.visited.add(target_url["url"])
                     with self._lock:
-                        self._pending += 1
-                    job = self.pool.submit(
-                        self.load_url, target_url, self.config.timeout
-                    )
-                    job.add_done_callback(self._job_done)
+                        self.skipped += 1
+                    continue
+
+                self.seen_keys.add(key)
+                self.visited.add(target_url["url"])
+                with self._lock:
+                    self._pending += 1
+                    self.checked += 1
+                job = self.pool.submit(
+                    self.load_url, target_url, self.config.timeout
+                )
+                job.add_done_callback(self._job_done)
             except Exception as e:
                 print(e)
 

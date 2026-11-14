@@ -568,5 +568,276 @@ class TestHostGate(unittest.TestCase):
         thread.join()
 
 
+def start_fixture_server(pages, port=0):
+    """Serve an in-memory {path: (status, headers_dict, body)} site offline.
+
+    pages may also map a path to a string, which is served as 200 text/html.
+    Returns (server, base_url). Caller shuts the server down.
+    """
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            entry = pages.get(self.path)
+            if entry is None:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/html;charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"not found")
+                return
+            if isinstance(entry, str):
+                status, headers, body = 200, {"Content-Type": "text/html"}, entry.encode()
+            else:
+                status, headers, body = entry
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+    socketserver.TCPServer.allow_reuse_address = True
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", port), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = "http://127.0.0.1:{0}".format(server.server_address[1])
+    return server, base
+
+
+def run_crawl(base, inventory=None, gate=None, config=None):
+    """Run one Checker crawl against base with a clean shared queue."""
+    check = Checker(base, config or Config(), inventory=inventory, gate=gate)
+    with check.TO_PROCESS.mutex:
+        check.TO_PROCESS.queue.clear()
+    if inventory is not None:
+        check.prime_from_inventory()
+    check.TO_PROCESS.put(
+        {"parent": base, "url": base, "depth": 0, "tag": "", "attr": ""}
+    )
+    check.run()
+    check.pool.shutdown()
+    return check
+
+
+class TestCrawlInventory(unittest.TestCase):
+    """End-to-end crawls against localhost, asserting inventory contents."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.inv_path = os.path.join(self.tmpdir, "inventory.jsonl")
+        self.pages = {
+            "/": (
+                200,
+                {"Content-Type": "text/html; charset=utf-8"},
+                b'<a href="page2.html">p2</a>'
+                b'<a href="page2.html">p2 dup</a>'
+                b'<img src="logo.png">'
+                b'<a href="missing.html">broken</a>',
+            ),
+            "/page2.html": (
+                200,
+                {"Content-Type": "text/html"},
+                b'<a href="/">home</a>',
+            ),
+            "/logo.png": (200, {"Content-Type": "image/png"}, b"PNGDATA"),
+        }
+        self.server, self.base = start_fixture_server(self.pages)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def _load_rows(self):
+        with open(self.inv_path, "r", encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_full_inventory_rows_and_fields(self):
+        inv = InventoryStore(self.inv_path)
+        inv.open_for_writing()
+        check = run_crawl(self.base + "/", inventory=inv)
+        inv.rewrite()
+        inv.close()
+
+        rows = {r["url"]: r for r in self._load_rows()}
+        # Seed, page2 (deduped despite two identical links), logo, missing.
+        self.assertEqual(
+            set(rows),
+            {
+                self.base + "/",
+                self.base + "/page2.html",
+                self.base + "/logo.png",
+                self.base + "/missing.html",
+            },
+        )
+        for row in rows.values():
+            self.assertEqual(list(row.keys()), INVENTORY_FIELDS)
+
+        seed = rows[self.base + "/"]
+        self.assertEqual(seed["parent"], seed["url"])  # seed parent is itself
+        self.assertEqual(seed["depth"], 0)
+        self.assertEqual(seed["tag"], "")
+        self.assertEqual(seed["attr"], "")
+
+        page2 = rows[self.base + "/page2.html"]
+        self.assertEqual(page2["parent"], self.base + "/")
+        self.assertEqual(page2["depth"], 1)
+        self.assertEqual(page2["tag"], "a")
+        self.assertEqual(page2["attr"], "href")
+
+        logo = rows[self.base + "/logo.png"]
+        self.assertEqual(logo["tag"], "img")
+        self.assertEqual(logo["attr"], "src")
+        self.assertEqual(logo["content_type"], "image/png")
+        self.assertEqual(logo["bytes"], 7)
+
+        # A 404 is still a response: status recorded, error stays null.
+        missing = rows[self.base + "/missing.html"]
+        self.assertEqual(missing["status"], 404)
+        self.assertIsNone(missing["error"])
+
+        # Old YAML report behavior is intact alongside the inventory.
+        self.assertEqual(len(check.broken), 1)
+        self.assertEqual(check.broken[0]["code"], 404)
+
+    def test_normalization_dedup_across_casing_and_default_port(self):
+        # No real requests: a stubbed fetch records which distinct keys were
+        # probed. The three links normalize to the same key, so only one row.
+        inv = InventoryStore(self.inv_path)
+        inv.open_for_writing()
+        check = Checker(self.base + "/", Config(), inventory=inv)
+        with check.TO_PROCESS.mutex:
+            check.TO_PROCESS.queue.clear()
+        probed = []
+
+        def fake_load(page, timeout):
+            probed.append(normalize_url(page["url"]))
+            row = check._make_row(page)
+            row["status"] = 200
+            row["content_type"] = "text/html"
+            row["checked_at"] = "2026-01-01T00:00:00+00:00"
+            check._record_row(row)
+            return {
+                "url": page["url"],
+                "parent": page["parent"],
+                "data": "",
+                "valid_content_type": False,
+            }
+
+        check.load_url = fake_load
+        port = self.server.server_address[1]
+        variants = [
+            "http://127.0.0.1:{0}/x".format(port),
+            "http://127.0.0.1:{0}/X".format(port),  # path case differs: distinct
+            "http://127.0.0.1:{0}/x?y=1".format(port),  # query differs: distinct
+        ]
+        for link in variants:
+            check.TO_PROCESS.put(
+                {"parent": self.base + "/", "url": link, "depth": 1,
+                 "tag": "a", "attr": "href"}
+            )
+        check.run()
+        check.pool.shutdown()
+        inv.rewrite()
+        inv.close()
+
+        self.assertEqual(len(probed), 3)
+        keys = [normalize_url(r["url"]) for r in self._load_rows()]
+        self.assertEqual(len(keys), len(set(keys)))
+
+        # And a case/port-only variant of an existing key collapses to one row.
+        inv2 = InventoryStore(os.path.join(self.tmpdir, "inv2.jsonl"))
+        inv2.open_for_writing()
+        check2 = Checker(self.base + "/", Config(), inventory=inv2)
+        with check2.TO_PROCESS.mutex:
+            check2.TO_PROCESS.queue.clear()
+        seen = []
+
+        def fake_load2(page, timeout):
+            seen.append(page["url"])
+            row = check2._make_row(page)
+            row["status"] = 200
+            row["checked_at"] = "2026-01-01T00:00:00+00:00"
+            check2._record_row(row)
+            return None
+
+        check2.load_url = fake_load2
+        same_key = [
+            "http://127.0.0.1:{0}/a".format(port),
+            "http://127.0.0.1:{0}/a#frag".format(port),
+            "http://127.0.0.1:{0}/./a".format(port),
+        ]
+        for link in same_key:
+            check2.TO_PROCESS.put(
+                {"parent": self.base + "/", "url": link, "depth": 1,
+                 "tag": "a", "attr": "href"}
+            )
+        check2.run()
+        check2.pool.shutdown()
+        inv2.close()
+        self.assertEqual(len(seen), 1)
+
+    def test_resume_skips_successful_links(self):
+        inv = InventoryStore(self.inv_path)
+        inv.open_for_writing()
+        first = run_crawl(self.base + "/", inventory=inv)
+        inv.close()
+        self.assertEqual(first.skipped, 0)
+        self.assertEqual(first.checked, 4)
+
+        inv2 = InventoryStore(self.inv_path)
+        inv2.load()
+        inv2.open_for_writing()
+        second = run_crawl(self.base + "/", inventory=inv2)
+        inv2.rewrite()
+        inv2.close()
+
+        self.assertEqual(second.checked, 0)
+        self.assertEqual(second.skipped, 4)
+        # Still exactly one line per link after the resume run.
+        self.assertEqual(len(self._load_rows()), 4)
+
+    def test_refresh_reprobes_and_overwrites_rows(self):
+        inv = InventoryStore(self.inv_path)
+        inv.open_for_writing()
+        run_crawl(self.base + "/", inventory=inv)
+        inv.close()
+        before = {r["url"]: r["checked_at"] for r in self._load_rows()}
+
+        inv2 = InventoryStore(self.inv_path, refresh=True)
+        inv2.load()
+        inv2.open_for_writing()
+        check = run_crawl(self.base + "/", inventory=inv2)
+        inv2.rewrite()
+        inv2.close()
+
+        self.assertEqual(check.skipped, 0)
+        self.assertEqual(check.checked, 4)
+        rows = self._load_rows()
+        self.assertEqual(len(rows), 4)  # overwritten, not duplicated
+
+    def test_failed_probe_still_gets_a_row(self):
+        inv = InventoryStore(self.inv_path)
+        inv.open_for_writing()
+        # Nothing listens here: connection refused, no response.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        dead_port = sock.getsockname()[1]
+        sock.close()
+        dead = "http://127.0.0.1:{0}/".format(dead_port)
+        quick = Config()
+        quick.timeout = 2
+        check = run_crawl(dead, inventory=inv, config=quick)
+        inv.close()
+
+        rows = self._load_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], 0)
+        self.assertEqual(rows[0]["error"], "connection_refused")
+        # And the failure still feeds the classic broken-link report.
+        self.assertEqual(len(check.broken), 1)
+        self.assertEqual(check.broken[0]["code"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
