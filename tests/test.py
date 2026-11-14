@@ -1,13 +1,24 @@
 import functools
 import http.server
 import os
+import socket
 import socketserver
+import ssl
 import tempfile
 import threading
 import time
 import unittest
+from urllib import error
 
-from hydra import Checker, Config, Parser, extract_domain
+from hydra import (
+    Checker,
+    Config,
+    Parser,
+    TooManyRedirects,
+    classify_error,
+    extract_domain,
+    normalize_url,
+)
 
 HTMLDATA = os.path.join(os.path.dirname(__file__), "data/test-page.html")
 CONFIGDATA = os.path.join(os.path.dirname(__file__), "data/basic_config.json")
@@ -209,6 +220,114 @@ class TestCases(unittest.TestCase):
             f"OK = [200, 999, 403]"
         )
         self.assertEqual(str(results), expected)
+
+
+class TestNormalization(unittest.TestCase):
+    """normalize_url implements the de-duplication rules from the spec."""
+
+    def test_scheme_and_host_case_insensitive(self):
+        self.assertEqual(
+            normalize_url("HTTPS://Example.COM/path"),
+            "https://example.com/path",
+        )
+
+    def test_default_ports_removed_others_kept(self):
+        self.assertEqual(normalize_url("http://example.com:80/a"), "http://example.com/a")
+        self.assertEqual(normalize_url("https://example.com:443/a"), "https://example.com/a")
+        self.assertEqual(
+            normalize_url("https://example.com:8443/a"),
+            "https://example.com:8443/a",
+        )
+
+    def test_fragment_removed(self):
+        self.assertEqual(
+            normalize_url("https://example.com/a#frag"),
+            "https://example.com/a",
+        )
+
+    def test_empty_path_becomes_slash(self):
+        self.assertEqual(normalize_url("https://example.com"), "https://example.com/")
+        self.assertEqual(normalize_url("https://example.com?x=1"), "https://example.com/?x=1")
+
+    def test_dot_segments_resolved(self):
+        self.assertEqual(
+            normalize_url("https://example.com/a/b/./c/../d"),
+            "https://example.com/a/b/d",
+        )
+        self.assertEqual(
+            normalize_url("https://example.com/../a"),
+            "https://example.com/a",
+        )
+
+    def test_double_slash_and_trailing_slash_preserved(self):
+        self.assertEqual(
+            normalize_url("https://example.com/a//b/"),
+            "https://example.com/a//b/",
+        )
+
+    def test_query_kept_verbatim_and_distinct(self):
+        self.assertEqual(
+            normalize_url("https://example.com/a?b=2&a=1"),
+            "https://example.com/a?b=2&a=1",
+        )
+        self.assertNotEqual(
+            normalize_url("https://example.com/a?x=1"),
+            normalize_url("https://example.com/a?x=2"),
+        )
+
+    def test_invalid_urls_raise(self):
+        for bad in ("not a url", "/relative/path", "//example.com/no-scheme"):
+            with self.assertRaises(ValueError):
+                normalize_url(bad)
+
+    def test_ipv6_and_userinfo_kept(self):
+        self.assertEqual(
+            normalize_url("http://user:pass@[::1]:8080/x"),
+            "http://user:pass@[::1]:8080/x",
+        )
+
+
+class TestErrorClassification(unittest.TestCase):
+    """classify_error returns one stable category name per failure mode."""
+
+    def test_known_categories(self):
+        cases = [
+            (socket.timeout(), "timeout"),
+            (TimeoutError(), "timeout"),
+            (socket.gaierror("[Errno -2] Name or service not known"), "dns_error"),
+            (ConnectionRefusedError(), "connection_refused"),
+            (ssl.SSLError("handshake failure"), "tls_error"),
+            (TooManyRedirects(), "too_many_redirects"),
+            (ValueError("bad url"), "invalid_url"),
+        ]
+        for exc, expected in cases:
+            with self.subTest(exc=exc):
+                self.assertEqual(classify_error(exc), expected)
+
+    def test_urlerror_reasons_unwrapped(self):
+        self.assertEqual(
+            classify_error(error.URLError(socket.timeout())),
+            "timeout",
+        )
+        self.assertEqual(
+            classify_error(error.URLError(ssl.SSLError("boom"))),
+            "tls_error",
+        )
+        self.assertEqual(
+            classify_error(error.URLError(ConnectionRefusedError())),
+            "connection_refused",
+        )
+        self.assertEqual(
+            classify_error(error.URLError(socket.gaierror())),
+            "dns_error",
+        )
+        self.assertEqual(
+            classify_error(error.URLError("plain string reason")),
+            "network_error",
+        )
+
+    def test_unknown_exception_is_network_error(self):
+        self.assertEqual(classify_error(OSError("mystery")), "network_error")
 
 
 if __name__ == "__main__":

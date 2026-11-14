@@ -1,6 +1,8 @@
 import argparse
 import gzip
 import json
+import socket
+import ssl
 import sys
 import threading
 from concurrent import futures
@@ -10,6 +12,161 @@ from os import path
 from queue import Empty, Queue
 from socket import timeout as SocketTimeoutError
 from urllib import error, parse, request
+
+
+# Stable error category names written to the inventory's "error" field.
+ERROR_TIMEOUT = "timeout"
+ERROR_DNS = "dns_error"
+ERROR_CONNECTION_REFUSED = "connection_refused"
+ERROR_TLS = "tls_error"
+ERROR_TOO_MANY_REDIRECTS = "too_many_redirects"
+ERROR_INVALID_URL = "invalid_url"
+ERROR_NETWORK = "network_error"
+
+# Fields of one inventory line, in a fixed order.
+INVENTORY_FIELDS = [
+    "url",
+    "parent",
+    "depth",
+    "tag",
+    "attr",
+    "status",
+    "content_type",
+    "bytes",
+    "redirects",
+    "elapsed_ms",
+    "error",
+    "checked_at",
+]
+
+# Default ports that disappear during URL normalization.
+DEFAULT_PORTS = {"http": 80, "https": 443, "ftp": 21}
+
+
+class TooManyRedirects(Exception):
+    """Raised when a request follows more redirects than allowed."""
+
+
+def _resolve_path_dots(url_path):
+    """Resolve '.' and '..' segments in a URL path, preserving everything else.
+
+    Unlike os.path normpath this keeps empty segments (double slashes) and a
+    trailing slash, which are significant in URLs.
+    """
+    leading_slash = url_path.startswith("/")
+    output = []
+    for segment in url_path.split("/"):
+        if segment == "..":
+            if output and output[-1] not in ("", ".."):
+                output.pop()
+            elif not leading_slash:
+                output.append("..")
+        elif segment == ".":
+            continue
+        else:
+            output.append(segment)
+    resolved = "/".join(output)
+    if leading_slash and not resolved.startswith("/"):
+        resolved = "/" + resolved
+    return resolved
+
+
+def normalize_url(url):
+    """Return the canonical form of an absolute URL for de-duplication.
+
+    Rules: scheme and host are case-folded, default ports are removed, the
+    fragment is dropped, an empty path becomes "/", and "."/".." path segments
+    are resolved. The query string is kept verbatim and never reordered, so
+    links differing only by query stay distinct.
+
+    Raises ValueError for anything that is not an absolute URL.
+    """
+    parts = parse.urlsplit(url)
+    if parts.scheme == "" or parts.hostname is None:
+        raise ValueError("not an absolute URL: {0}".format(url))
+
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    port = parts.port
+    if port is not None and DEFAULT_PORTS.get(scheme) == port:
+        port = None
+
+    userinfo = ""
+    if parts.username is not None:
+        userinfo = parts.username
+        if parts.password is not None:
+            userinfo += ":" + parts.password
+        userinfo += "@"
+
+    if ":" in host:  # IPv6 literal
+        netloc = "{0}[{1}]".format(userinfo, host)
+    else:
+        netloc = userinfo + host
+    if port is not None:
+        netloc += ":" + str(port)
+
+    normalized_path = _resolve_path_dots(parts.path or "/")
+    # Fragment is deliberately discarded; query order is deliberately kept.
+    return parse.urlunsplit((scheme, netloc, normalized_path, parts.query, ""))
+
+
+def classify_error(exc):
+    """Map a fetch exception to one of the stable ERROR_* category names."""
+    if isinstance(exc, TooManyRedirects):
+        return ERROR_TOO_MANY_REDIRECTS
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return ERROR_TIMEOUT
+    if isinstance(exc, ssl.SSLError):
+        return ERROR_TLS
+    if isinstance(exc, ConnectionRefusedError):
+        return ERROR_CONNECTION_REFUSED
+    if isinstance(exc, error.URLError):
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return ERROR_TIMEOUT
+        if isinstance(reason, ssl.SSLError):
+            return ERROR_TLS
+        if isinstance(reason, ConnectionRefusedError):
+            return ERROR_CONNECTION_REFUSED
+        if isinstance(reason, socket.gaierror):
+            return ERROR_DNS
+        return ERROR_NETWORK
+    if isinstance(exc, socket.gaierror):
+        return ERROR_DNS
+    if isinstance(exc, (InvalidURL, UnicodeError, TypeError, ValueError)):
+        return ERROR_INVALID_URL
+    return ERROR_NETWORK
+
+
+class HostGate:
+    """Per-host request spacing and concurrency limits (skeleton)."""
+
+    def __init__(self, interval=0.0, max_per_host=0):
+        self.interval = interval
+        self.max_per_host = max_per_host
+
+    def acquire(self, host):
+        """Block until a request to host may start."""
+        # Filled in a later step.
+        raise NotImplementedError
+
+    def release(self, host):
+        """Release one concurrency slot for host."""
+        # Filled in a later step.
+        raise NotImplementedError
+
+
+class InventoryStore:
+    """Append-only JSONL inventory with resume support (skeleton)."""
+
+    def __init__(self, filename=None, refresh=False):
+        self.filename = filename
+        self.refresh = refresh
+
+    def load(self):
+        """Merge any existing inventory rows into memory."""
+        # Filled in a later step.
+        raise NotImplementedError
 
 
 class Config:
