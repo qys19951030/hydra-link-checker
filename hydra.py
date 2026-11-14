@@ -1,6 +1,7 @@
 import argparse
 import gzip
 import json
+import os
 import socket
 import ssl
 import sys
@@ -157,16 +158,133 @@ class HostGate:
 
 
 class InventoryStore:
-    """Append-only JSONL inventory with resume support (skeleton)."""
+    """Append-only JSONL inventory with resume support.
+
+    One row per normalized URL. Rows are written one JSON object per line as
+    soon as a probe finishes, each line flushed and fsynced so a killed
+    process leaves no half line behind. On startup the existing file is
+    merged: a trailing partial line (e.g. from SIGKILL mid-write) is ignored,
+    later rows for the same key override earlier ones, and ordering follows
+    the key's first appearance.
+    """
 
     def __init__(self, filename=None, refresh=False):
         self.filename = filename
         self.refresh = refresh
+        self._lock = threading.Lock()
+        # key -> row; dict preserves first-insertion order.
+        self._rows = {}
+        # Keys whose row came from the current run's file (or a previous run)
+        # and represents a successful probe. Used for resume skipping.
+        self._success = set()
+        self._file = None
 
     def load(self):
-        """Merge any existing inventory rows into memory."""
-        # Filled in a later step.
-        raise NotImplementedError
+        """Merge any existing inventory rows into memory.
+
+        Returns the number of complete rows read. A truncated final line is
+        skipped rather than raising, so a crash mid-write stays recoverable.
+        """
+        if not self.filename or not os.path.exists(self.filename):
+            return 0
+        count = 0
+        with open(self.filename, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    key = normalize_url(row["url"])
+                except (ValueError, KeyError, json.JSONDecodeError):
+                    # Partial line from a crash or otherwise unparseable row.
+                    continue
+                self._rows[key] = row
+                if row.get("error") is None and row.get("status", 0) > 0:
+                    self._success.add(key)
+                count += 1
+        return count
+
+    def open_for_writing(self):
+        """Open the inventory in append mode for incremental rows."""
+        if self.filename:
+            self._file = open(self.filename, "a", encoding="utf-8")
+
+    def has(self, key):
+        with self._lock:
+            return key in self._rows
+
+    def should_skip(self, key):
+        """Resume rule: a previously successful row means no new request.
+
+        --refresh ignores old results and re-probes everything.
+        """
+        if self.refresh:
+            return False
+        with self._lock:
+            return key in self._success
+
+    def record(self, row):
+        """Overwrite the row for its key and append one full JSON line.
+
+        The line is flushed and fsynced before returning, so on Ctrl-C or a
+        killed process every persisted line is complete and independently
+        parseable. With no filename the row stays in memory only.
+        """
+        try:
+            key = normalize_url(row["url"])
+        except ValueError:
+            # An un-normalizable URL is keyed by its raw value so it still
+            # gets exactly one row.
+            key = row["url"]
+        line = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+        with self._lock:
+            self._rows[key] = row
+            if row.get("error") is None and row.get("status", 0) > 0:
+                self._success.add(key)
+            elif key in self._success:
+                self._success.discard(key)
+            if self._file is not None:
+                self._file.write(line + "\n")
+                self._file.flush()
+                os.fsync(self._file.fileno())
+
+    def rows(self):
+        """All current rows in first-appearance order."""
+        with self._lock:
+            return list(self._rows.values())
+
+    def keys(self):
+        with self._lock:
+            return list(self._rows.keys())
+
+    def get(self, key):
+        with self._lock:
+            return self._rows.get(key)
+
+    def rewrite(self):
+        """Write the de-duplicated rows back atomically.
+
+        Appending across resume/refresh runs can leave superseded duplicate
+        lines on disk; this rewrites the file via a temp file and os.replace
+        so the on-disk inventory ends with exactly one line per key in
+        first-appearance order.
+        """
+        if not self.filename:
+            return
+        tmp_name = self.filename + ".tmp"
+        with open(tmp_name, "w", encoding="utf-8") as handle:
+            for row in self.rows():
+                handle.write(
+                    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, self.filename)
+
+    def close(self):
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
 
 class Config:

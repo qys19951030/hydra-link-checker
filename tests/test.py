@@ -1,5 +1,6 @@
 import functools
 import http.server
+import json
 import os
 import socket
 import socketserver
@@ -13,6 +14,8 @@ from urllib import error
 from hydra import (
     Checker,
     Config,
+    INVENTORY_FIELDS,
+    InventoryStore,
     Parser,
     TooManyRedirects,
     classify_error,
@@ -328,6 +331,160 @@ class TestErrorClassification(unittest.TestCase):
 
     def test_unknown_exception_is_network_error(self):
         self.assertEqual(classify_error(OSError("mystery")), "network_error")
+
+
+def make_row(url, parent=None, status=200, error=None, **overrides):
+    """Build an inventory row with the fixed field set for use in tests."""
+    row = {
+        "url": url,
+        "parent": parent if parent is not None else url,
+        "depth": overrides.pop("depth", 0),
+        "tag": overrides.pop("tag", ""),
+        "attr": overrides.pop("attr", ""),
+        "status": status,
+        "content_type": overrides.pop("content_type", "text/html"),
+        "bytes": overrides.pop("bytes", 0),
+        "redirects": overrides.pop("redirects", []),
+        "elapsed_ms": overrides.pop("elapsed_ms", 1),
+        "error": error,
+        "checked_at": overrides.pop(
+            "checked_at", "2026-01-01T00:00:00+00:00"
+        ),
+    }
+    row.update(overrides)
+    return row
+
+
+class TestInventoryStore(unittest.TestCase):
+    """JSONL inventory: merge, resume skip, refresh overwrite, half lines."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False
+        )
+        self.tmp.close()
+        self.path = self.tmp.name
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def _read_lines(self):
+        with open(self.path, "r", encoding="utf-8") as handle:
+            return [line for line in handle.read().splitlines() if line]
+
+    def test_rows_appended_one_json_per_line_and_parseable(self):
+        store = InventoryStore(self.path)
+        store.open_for_writing()
+        store.record(make_row("https://example.com/a"))
+        store.record(make_row("https://example.com/b"))
+        store.close()
+
+        lines = self._read_lines()
+        self.assertEqual(len(lines), 2)
+        parsed = [json.loads(line) for line in lines]
+        self.assertEqual([row["url"] for row in parsed], [
+            "https://example.com/a",
+            "https://example.com/b",
+        ])
+        for row in parsed:
+            self.assertEqual(list(row.keys()), INVENTORY_FIELDS)
+
+    def test_half_written_final_line_is_ignored_on_merge(self):
+        good = make_row("https://example.com/good")
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(good) + "\n")
+            handle.write('{"url": "https://example.com/half", "stat')  # no newline
+
+        store = InventoryStore(self.path)
+        loaded = store.load()
+        self.assertEqual(loaded, 1)
+        self.assertTrue(store.has(normalize_url("https://example.com/good")))
+        self.assertFalse(store.has(normalize_url("https://example.com/half")))
+
+    def test_merge_dedupes_latest_wins_but_order_is_first_seen(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(make_row("https://example.com/a", status=200)) + "\n")
+            handle.write(json.dumps(make_row("https://example.com/b", status=200)) + "\n")
+            # Same normalized URL as the first row, different case/port.
+            handle.write(
+                json.dumps(make_row("https://EXAMPLE.com:443/a", status=500)) + "\n"
+            )
+
+        store = InventoryStore(self.path)
+        store.load()
+        rows = store.rows()
+        # One row per normalized key, ordered by first appearance.
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [normalize_url(r["url"]) for r in rows],
+            ["https://example.com/a", "https://example.com/b"],
+        )
+        # The later line overwrites the earlier one, raw spelling included.
+        self.assertEqual(rows[0]["url"], "https://EXAMPLE.com:443/a")
+        self.assertEqual(rows[0]["status"], 500)
+
+    def test_resume_skips_successful_rows_but_retries_failures(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(make_row("https://example.com/ok", status=200)) + "\n")
+            handle.write(
+                json.dumps(make_row("https://example.com/bad", status=0, error="dns_error"))
+                + "\n"
+            )
+
+        store = InventoryStore(self.path)
+        store.load()
+        self.assertTrue(store.should_skip(normalize_url("https://example.com/ok")))
+        self.assertFalse(store.should_skip(normalize_url("https://example.com/bad")))
+
+    def test_refresh_reprobes_everything(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(make_row("https://example.com/ok", status=200)) + "\n")
+
+        store = InventoryStore(self.path, refresh=True)
+        store.load()
+        self.assertFalse(store.should_skip(normalize_url("https://example.com/ok")))
+        # Old rows are still known, so a refresh overwrites in place.
+        self.assertTrue(store.has(normalize_url("https://example.com/ok")))
+
+    def test_reprobe_overwrites_same_row_and_keeps_first_order(self):
+        store = InventoryStore(self.path)
+        store.open_for_writing()
+        store.record(make_row("https://example.com/a", status=200))
+        store.record(make_row("https://example.com/b", status=200))
+        store.record(make_row("https://example.com/a", status=404))
+        store.close()
+
+        rows = store.rows()
+        self.assertEqual([r["url"] for r in rows], [
+            "https://example.com/a",
+            "https://example.com/b",
+        ])
+        self.assertEqual(rows[0]["status"], 404)
+
+    def test_rewrite_leaves_one_line_per_key(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(make_row("https://example.com/a", status=200)) + "\n")
+            handle.write(json.dumps(make_row("https://example.com/b", status=200)) + "\n")
+            handle.write(
+                json.dumps(make_row("https://EXAMPLE.COM/a", status=404)) + "\n"
+            )
+
+        store = InventoryStore(self.path)
+        store.load()
+        store.rewrite()
+
+        lines = self._read_lines()
+        self.assertEqual(len(lines), 2)
+        keys = [normalize_url(json.loads(line)["url"]) for line in lines]
+        self.assertEqual(keys, ["https://example.com/a", "https://example.com/b"])
+        self.assertEqual(json.loads(lines[0])["status"], 404)
+
+    def test_in_memory_store_without_filename(self):
+        store = InventoryStore()
+        store.record(make_row("https://example.com/a"))
+        self.assertEqual(len(store.rows()), 1)
+        store.rewrite()  # must be a no-op, not an error
+        store.close()
 
 
 if __name__ == "__main__":
